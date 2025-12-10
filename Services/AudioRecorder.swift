@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Combine
 
 class AudioRecorder: NSObject, ObservableObject {
     private var audioEngine = AVAudioEngine()

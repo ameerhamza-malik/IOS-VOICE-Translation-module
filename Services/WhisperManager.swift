@@ -1,26 +1,25 @@
-import Foundation
 import WhisperKit
 import AVFoundation
+import Combine
 
 class WhisperManager: ObservableObject, SpeechBufferDelegate {
     
     @Published var isModelLoaded = false
-    @Published var currentText = "" // Making this the "Finalized" text
-    @Published var partialText = "" // The current in-progress text
+    @Published var currentText = ""
+    @Published var partialText = ""
     @Published var audioLevel: Float = 0.0
     
     private var whisperKit: WhisperKit?
     private var bufferManager = SpeechBufferManager()
     
-    // Serial queue to prevent inference overlaps
-    private let inferenceQueue = DispatchQueue(label: "com.translationapp.inference")
+    // Use a Task for inference to support async/await
     private var isInferencing = false
+    private let inferenceLock = NSLock()
     
     // User requested specific optimized model (~626MB)
-    // This allows for 'Large' accuracy within the 700MB constraint.
     let modelName = "openai_whisper-large-v3-v20240930_626MB" 
     
-    override init() {
+    init() {
         bufferManager.delegate = self
     }
     
@@ -28,7 +27,7 @@ class WhisperManager: ObservableObject, SpeechBufferDelegate {
         do {
             print("Initializing WhisperKit...")
             let pipe = try await WhisperKit(computeOptions: .init(modelName: modelName))
-            DispatchQueue.main.async {
+            await MainActor.run {
                 self.whisperKit = pipe
                 self.isModelLoaded = true
                 print("WhisperKit loaded!")
@@ -57,55 +56,53 @@ class WhisperManager: ObservableObject, SpeechBufferDelegate {
     }
     
     func didDetectSpeechStart() {
-        // Optional: UI feedback
+        // Optional hook
     }
     
     func didUpdatePartialBuffer(buffer: [Float]) {
-        // Run light/fast inference for preview?
-        // OR: Just wait. For "Real Time", we run it.
-        // We debounce this to avoid choking the engine.
-        
-        guard !isInferencing else { return }
-        
-        inferenceQueue.async { [weak self] in
-            guard let self = self, let pipe = self.whisperKit else { return }
-            self.isInferencing = true
-            
-            do {
-                // Running transcribe on current buffer
-                let results = try await pipe.transcribe(audioArray: buffer)
-                let text = results.text ?? ""
+        // Debounce / Check lock
+        if inferenceLock.try() {
+            Task {
+                defer { inferenceLock.unlock() }
+                guard let pipe = whisperKit else { return }
                 
-                DispatchQueue.main.async {
-                    self.partialText = text
+                do {
+                    let results = try await pipe.transcribe(audioArray: buffer)
+                    // Results is [TranscriptionResult] or similar, usually has a .text property or we map it
+                    let text = results.map { $0.text }.joined(separator: " ")
+                    
+                    await MainActor.run {
+                        self.partialText = text
+                    }
+                } catch {
+                    print("Partial Error: \(error)")
                 }
-            } catch {
-                print(error)
             }
-            
-            self.isInferencing = false
         }
     }
     
     func didDetectSpeechEnd(segment: [Float]) {
-        // High priority inference for final result
-        inferenceQueue.async { [weak self] in
-            guard let self = self, let pipe = self.whisperKit else { return }
-            self.isInferencing = true // Block partials
+        // High priority - Wait for lock or just launch
+        Task {
+            // Simple lock spin or just go for it (race condition acceptable for final vs partial)
+            inferenceLock.lock()
+            defer { inferenceLock.unlock() }
+            
+            guard let pipe = whisperKit else { return }
             
             do {
                 let results = try await pipe.transcribe(audioArray: segment)
-                if let text = results.text {
-                    DispatchQueue.main.async {
+                let text = results.map { $0.text }.joined(separator: " ")
+                
+                if !text.isEmpty {
+                    await MainActor.run {
                         self.currentText += " " + text
-                        self.partialText = "" // Clear partial
+                        self.partialText = ""
                     }
                 }
             } catch {
                 print("Finalize error: \(error)")
             }
-            
-            self.isInferencing = false
         }
     }
 }
